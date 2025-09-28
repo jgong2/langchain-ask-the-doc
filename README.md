@@ -1,18 +1,21 @@
-# 🦜🔗 LangChain - Ask the Doc
+# Supplier Audit Assistant (Local-Only)
 
-Build a Document Question Answering app using LangChain and Streamlit.
+Reads supplier PDFs/DOCX and answers audit questions with inline citations `(filename#chunkN)`.
 
-## Demo App
+**How it runs**
+- Embeddings: FastEmbed (`BAAI/bge-small-en-v1.5`) – local
+- LLM: Ollama (`phi3:mini`) – local
+- No OpenAI key needed (we hit 429 quota earlier and went fully local)
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://langchain-ask-the-doc.streamlit.app/)
+## Use it (on my machine)
+This demo runs on my laptop. If you want to try it, message me and I’ll open a time window.
 
-## Get an OpenAI API key
-
-You can get your own OpenAI API key by following the following instructions:
-1. Go to https://platform.openai.com/account/api-keys.
-2. Click on the `+ Create new secret key` button.
-3. Next, enter an identifier name (optional) and click on the `Create secret key` button.
-
-## Try out the app
-
-Once the app is loaded, go ahead and enter your OpenAI API key and type a question in the text box and wait for a generated response.
+## Run it yourself (macOS)
+```bash
+# 1) go to folder
+cd ~/Documents/GitHub/langchain-ask-the-doc
+# 2) activate venv
+source .venv/bin/activate
+# 3) start the app
+streamlit run streamlit_app.py
+# stop with Ctrl+C
