@@ -1,212 +1,172 @@
+# streamlit_app.py  —  Phase 2.1 (OpenAI-only)
 import os
-import tempfile
-from typing import List
-
+import io
 import streamlit as st
 
-# Loaders / splitters / vector store
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+# LangChain bits
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# Local embeddings (FastEmbed)
-from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+# --------------------------
+# Page / constants
+# --------------------------
+st.set_page_config(page_title="Supplier Audit Assistant — OpenAI (Phase 2.1)", page_icon="📄", layout="wide")
+st.title("📄 Supplier Audit Assistant — Phase 2.1 (OpenAI only)")
 
-# Local LLM via Ollama
-from langchain_community.chat_models.ollama import ChatOllama
+CHUNK_SIZE = 1100
+CHUNK_OVERLAP = 150
+EMBED_MODEL = st.secrets.get("OPENAI_EMBED_MODEL", os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+CHAT_MODEL  = st.secrets.get("OPENAI_CHAT_MODEL",  os.getenv("OPENAI_CHAT_MODEL",  "gpt-4o-mini"))
 
-# Prompting & runnable utils
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
+# --------------------------
+# Ensure OpenAI key is set
+# --------------------------
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+if OPENAI_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_KEY
+else:
+    st.error("OPENAI_API_KEY is missing. Add it to .streamlit/secrets.toml")
+    st.stop()
 
+with st.sidebar:
+    st.markdown("### How to use")
+    st.markdown("1) Upload PDFs/DOCX/TXT\n2) Click **Build index**\n3) Ask a question — citations show like `(filename#chunkN)`")
 
-# -------------------------
-# Page setup
-# -------------------------
-st.set_page_config(page_title="Supplier Audit Assistant", page_icon="🧭", layout="wide")
-st.title("🧭 Supplier Audit Assistant — Ask the Doc (RAG)")
-st.caption("Upload supplier PDFs/DOCX, ask audit questions, and get answers with (filename#chunkN) citations. (Fully local: embeddings + LLM)")
+# --------------------------
+# File loading helpers
+# --------------------------
+def load_file(uploaded):
+    """Return extracted text from PDF/DOCX/TXT."""
+    name = uploaded.name
+    data = uploaded.read()
+    if name.lower().endswith(".pdf"):
+        # Try pdfplumber first (better layout), fall back to pypdf
+        try:
+            import pdfplumber
+            text = ""
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text() or ""
+                    text += t + "\n"
+            return text
+        except Exception:
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                return "\n".join([(p.extract_text() or "") for p in reader.pages])
+            except Exception:
+                return ""
+    elif name.lower().endswith(".docx"):
+        import docx2txt, tempfile, os as _os
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        try:
+            return docx2txt.process(tmp_path) or ""
+        finally:
+            try: _os.remove(tmp_path)
+            except: pass
+    else:
+        # .txt or unknown → try utf-8
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-# -------------------------
-# Constants (tunable)
-# -------------------------
-CHUNK_SIZE_DEFAULT = 1100
-CHUNK_OVERLAP_DEFAULT = 150
-
-# Local embedding model (FastEmbed)
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-
-# Local chat model served by Ollama (make sure `ollama pull phi3:mini`)
-LLM_MODEL = "phi3:mini"
-
-K_RETRIEVAL = 4
-
-SYSTEM_PROMPT = (
-    "You are a senior Supplier Quality Auditor AI. Your job is to answer audit questions "
-    "using ONLY the provided document context. If the answer is not in the context, say you "
-    "don't have enough information and suggest what evidence would satisfy the audit.\n\n"
-    "Rules:\n"
-    "- Be concise, factual, and use audit language (e.g., objective evidence, procedure, record, control, risk).\n"
-    "- Cite sources inline immediately after the sentence they support using this exact format: (filename#chunkN).\n"
-    "  Example: The supplier's PPAP is signed (ppap_manual.pdf#chunk3).\n"
-    "- If multiple chunks support a statement, include all: (fileA.pdf#chunk1; fileB.docx#chunk4).\n"
-    "- Do not fabricate citations or content.\n"
-)
-
-# -------------------------
-# Utilities
-# -------------------------
-def save_upload_to_temp(uploaded_file) -> str:
-    """Persist an uploaded file to a temp path and return the path."""
-    suffix = os.path.splitext(uploaded_file.name)[1]  # keep .pdf or .docx
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    with os.fdopen(fd, "wb") as tmp:
-        tmp.write(uploaded_file.getbuffer())
-    return path
-
-
-def load_documents(files: List) -> List[Document]:
-    docs: List[Document] = []
-    for f in files:
-        path = save_upload_to_temp(f)
-        filename = f.name
-        if filename.lower().endswith(".pdf"):
-            loader = PyPDFLoader(path)
-        elif filename.lower().endswith(".docx"):
-            loader = Docx2txtLoader(path)
-        else:
-            st.warning(f"Unsupported file type for {filename}; only PDF/DOCX are allowed.")
-            continue
-        file_docs = loader.load()
-        # Stamp filename into metadata now
-        for d in file_docs:
-            d.metadata = d.metadata or {}
-            d.metadata["filename"] = filename
-        docs.extend(file_docs)
+def chunk_text(full_text, source_name):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    docs = splitter.create_documents([full_text], metadatas=[{"source": source_name}])
+    for i, d in enumerate(docs):
+        d.metadata["chunk_id"] = f"{source_name}#chunk{i+1}"
     return docs
 
+# --------------------------
+# Vector store (OpenAI embeddings)
+# --------------------------
+@st.cache_resource(show_spinner=False)
+def build_vs(all_chunks):
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+    return FAISS.from_documents(all_chunks, embeddings)
 
-def chunk_documents(docs: List[Document], chunk_size: int, chunk_overlap: int) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=["\n\n", "\n", " ", ""]
-    )
-    chunks = splitter.split_documents(docs)
-    # add chunk indices per file for (filename#chunkN)
-    counters = {}
-    for d in chunks:
-        fname = d.metadata.get("filename", "document")
-        counters.setdefault(fname, 0)
-        counters[fname] += 1
-        d.metadata["chunk_id"] = counters[fname]
-    return chunks
-
-
-def build_vectorstore(chunks: List[Document]) -> FAISS:
-    # Local, free embeddings via FastEmbed (downloads model once, then cached)
-    embeddings = FastEmbedEmbeddings(model_name=EMBED_MODEL)
-    return FAISS.from_documents(chunks, embeddings)
-
-
-def format_docs_for_context(docs: List[Document]) -> str:
-    # Include source tag under each chunk so the LLM can cite precisely
-    formatted = []
+def citations_from(docs, max_refs=4):
+    seen, out = set(), []
     for d in docs:
-        fname = d.metadata.get("filename", "document")
-        cid = d.metadata.get("chunk_id", 0)
-        formatted.append(f"{d.page_content}\n\nSource: ({fname}#chunk{cid})")
-    return "\n\n---\n\n".join(formatted)
+        tag = d.metadata.get("chunk_id") or d.metadata.get("source") or "doc"
+        if tag not in seen:
+            out.append(tag); seen.add(tag)
+        if len(out) >= max_refs:
+            break
+    return ", ".join(out)
 
+def answer_with_rag(vs, question):
+    retriever = vs.as_retriever(search_kwargs={"k": 4})
+    docs = retriever.get_relevant_documents(question)
 
-# -------------------------
-# Sidebar controls
-# -------------------------
-with st.sidebar:
-    st.subheader("Settings")
-    chunk_size = st.number_input("Chunk size", min_value=300, max_value=2000, value=CHUNK_SIZE_DEFAULT, step=50)
-    chunk_overlap = st.number_input("Chunk overlap", min_value=0, max_value=400, value=CHUNK_OVERLAP_DEFAULT, step=10)
-    top_k = st.number_input("Top-k retrieval", min_value=1, max_value=10, value=K_RETRIEVAL, step=1)
-    st.markdown("---")
-    st.markdown("**Models**")
-    st.text(f"LLM (local via Ollama): {LLM_MODEL}")
-    st.text(f"Embeddings (local): {EMBED_MODEL}")
-    st.markdown("---")
-    st.info("This app runs fully local for indexing and answers. Make sure the Ollama server is running and the model is pulled.")
+    context = ""
+    for d in docs:
+        tag = d.metadata.get("chunk_id") or d.metadata.get("source") or "doc"
+        context += f"[{tag}]\n{d.page_content}\n\n"
 
-# -------------------------
-# File upload & indexing
-# -------------------------
+    system_prompt = (
+        "You are a Supplier Quality Auditor assistant. Use ONLY the provided context to answer. "
+        "Cite sources as (filename#chunkN). If the answer is not in the context, say you don't know."
+    )
+    user_prompt = f"Question: {question}\n\nContext:\n{context}\n\nAnswer:"
+
+    llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
+    resp = llm.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
+    text = (resp.content or "").strip()
+    refs = citations_from(docs)
+    if refs:
+        text += f"\n\n**Sources:** {refs}"
+    return text
+
+# --------------------------
+# UI
+# --------------------------
 uploaded_files = st.file_uploader(
-    "Upload supplier documents (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=True
+    "Upload one or more files", type=["pdf", "docx", "txt"], accept_multiple_files=True
 )
 
-build_clicked = st.button("Build / Rebuild Index", type="primary", disabled=not uploaded_files)
+if "vs" not in st.session_state:
+    st.session_state.vs = None
 
-if build_clicked:
-    with st.spinner("Loading, chunking, and embedding documents…"):
-        docs = load_documents(uploaded_files)
-        chunks = chunk_documents(docs, chunk_size, chunk_overlap)
-        vs = build_vectorstore(chunks)
-        st.session_state["vectorstore"] = vs
-        st.session_state["all_chunks"] = chunks
-        st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s).")
+c1, c2 = st.columns([1,1])
 
-# -------------------------
-# Q&A Section
-# -------------------------
-question = st.text_input("Ask an audit question (e.g., 'Is there a documented control plan for incoming inspection?')")
-ask_clicked = st.button("Ask")
+with c1:
+    if st.button("🔨 Build index (OpenAI)"):
+        if not uploaded_files:
+            st.warning("Please upload at least one file.")
+        else:
+            all_chunks = []
+            with st.spinner("Extracting and chunking..."):
+                for f in uploaded_files:
+                    txt = load_file(f)
+                    if txt and txt.strip():
+                        all_chunks.extend(chunk_text(txt, f.name))
+            if not all_chunks:
+                st.error("No text extracted from the files.")
+            else:
+                try:
+                    with st.spinner("Embedding & indexing with OpenAI..."):
+                        st.session_state.vs = build_vs(all_chunks)
+                    st.success(f"Index ready. {len(all_chunks)} chunks.")
+                except Exception as e:
+                    st.error(f"Embedding failed: {e}")
 
-if ask_clicked:
-    if "vectorstore" not in st.session_state:
-        st.warning("Please upload files and click 'Build / Rebuild Index' first.")
-    elif not question.strip():
-        st.warning("Please enter a question.")
-    else:
-        retriever = st.session_state["vectorstore"].as_retriever(search_kwargs={"k": int(top_k)})
-
-        def _format_docs(dlist: List[Document]) -> str:
-            return format_docs_for_context(dlist)
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            (
-                "human",
-                "Question: {question}\n\nContext (chunks with sources):\n{context}\n\n"
-                "Write a clear answer for a supplier audit. Use the inline citation format (filename#chunkN) right after the statements they support."
-            ),
-        ])
-
-        # Local LLM (Ollama)
-        llm = ChatOllama(model=LLM_MODEL, temperature=0)
-
-        chain = {
-            "question": RunnablePassthrough(),
-            "context": retriever | _format_docs,
-        } | prompt | llm | StrOutputParser()
-
-        try:
-            with st.spinner("Thinking…"):
-                answer = chain.invoke(question)
-            st.markdown("### Answer")
-            st.write(answer)
-        except Exception as e:
-            st.error(f"LLM call failed: {e}")
-            st.info("Retrieval succeeded. Here are the top sources so you can still see relevant content:")
-
-        # Show sources actually retrieved (even if the LLM call fails)
-        with st.expander("Sources used in retrieval"):
-            retrieved_docs: List[Document] = retriever.get_relevant_documents(question)
-            seen = set()
-            for d in retrieved_docs:
-                fname = d.metadata.get("filename", "document")
-                cid = d.metadata.get("chunk_id", 0)
-                tag = f"({fname}#chunk{cid})"
-                if tag in seen:
-                    continue
-                seen.add(tag)
-                st.markdown(f"- **{tag}**\n\n> {d.page_content[:400]}…")
-
-st.markdown("---")
-st.caption("Built with Streamlit + FastEmbed + LangChain + FAISS + Ollama (local). © Supplier Audit Assistant")
+with c2:
+    q = st.text_input("Ask an audit question… (e.g., “What are supplier PPAP requirements?”)")
+    if q and st.session_state.vs:
+        with st.spinner("Thinking…"):
+            try:
+                st.markdown(answer_with_rag(st.session_state.vs, q))
+            except Exception as e:
+                st.error(f"LLM call failed: {e}")
+    elif q and not st.session_state.vs:
+        st.info("Build the index first, then ask a question.")
