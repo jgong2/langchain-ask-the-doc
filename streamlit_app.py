@@ -1,120 +1,161 @@
-# streamlit_app.py  —  Phase 2.1 (OpenAI-only)
 import os
 import io
+from typing import List
+
 import streamlit as st
-
-# LangChain bits
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+
+import pdfplumber
+import docx2txt
 
 # --------------------------
-# Page / constants
+# Config / constants
 # --------------------------
-st.set_page_config(page_title="Supplier Audit Assistant — OpenAI (Phase 2.1)", page_icon="📄", layout="wide")
-st.title("📄 Supplier Audit Assistant — Phase 2.1 (OpenAI only)")
 
-CHUNK_SIZE = 1100
-CHUNK_OVERLAP = 150
-EMBED_MODEL = st.secrets.get("OPENAI_EMBED_MODEL", os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
-CHAT_MODEL  = st.secrets.get("OPENAI_CHAT_MODEL",  os.getenv("OPENAI_CHAT_MODEL",  "gpt-4o-mini"))
+BASELINE_ISO_DIR = "baseline_iso9001"
 
-# --------------------------
-# Ensure OpenAI key is set
-# --------------------------
-OPENAI_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if OPENAI_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_KEY
-else:
-    st.error("OPENAI_API_KEY is missing. Add it to .streamlit/secrets.toml")
-    st.stop()
+PROVIDER = st.secrets.get("PROVIDER", "openai")
+EMBED_MODEL = st.secrets.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+CHAT_MODEL = st.secrets.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
-with st.sidebar:
-    st.markdown("### How to use")
-    st.markdown("1) Upload PDFs/DOCX/TXT\n2) Click **Build index**\n3) Ask a question — citations show like `(filename#chunkN)`")
 
 # --------------------------
-# File loading helpers
+# Helpers: file loading
 # --------------------------
-def load_file(uploaded):
-    """Return extracted text from PDF/DOCX/TXT."""
-    name = uploaded.name
-    data = uploaded.read()
-    if name.lower().endswith(".pdf"):
-        # Try pdfplumber first (better layout), fall back to pypdf
-        try:
-            import pdfplumber
-            text = ""
-            with pdfplumber.open(io.BytesIO(data)) as pdf:
-                for page in pdf.pages:
-                    t = page.extract_text() or ""
-                    text += t + "\n"
-            return text
-        except Exception:
-            try:
-                from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(data))
-                return "\n".join([(p.extract_text() or "") for p in reader.pages])
-            except Exception:
-                return ""
-    elif name.lower().endswith(".docx"):
-        import docx2txt, tempfile, os as _os
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        try:
-            return docx2txt.process(tmp_path) or ""
-        finally:
-            try: _os.remove(tmp_path)
-            except: pass
+
+def load_pdf(file) -> str:
+    """Extract text from a PDF file-like object."""
+    text = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                text.append(page_text)
+    return "\n\n".join(text)
+
+
+def load_docx(file) -> str:
+    """Extract text from a DOCX file."""
+    # docx2txt needs a path or file-like object; we use buffer.
+    # Streamlit's UploadedFile has .read(), so we copy to BytesIO.
+    data = file.read()
+    buf = io.BytesIO(data)
+    text = docx2txt.process(buf)
+    # reset pointer so file can be reused if needed
+    file.seek(0)
+    return text or ""
+
+
+def load_txt(file) -> str:
+    return file.read().decode("utf-8", errors="ignore")
+
+
+def load_file(uploaded_file) -> str:
+    """Route based on file extension."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        return load_pdf(uploaded_file)
+    elif name.endswith(".docx"):
+        return load_docx(uploaded_file)
+    elif name.endswith(".txt"):
+        return load_txt(uploaded_file)
     else:
-        # .txt or unknown → try utf-8
-        try:
-            return data.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
+        return ""
 
-def chunk_text(full_text, source_name):
+
+# --------------------------
+# Helpers: chunking & embeddings
+# --------------------------
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+def chunk_text(text: str, source_name: str) -> List[Document]:
+    """Split raw text into smaller chunks with metadata."""
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        chunk_size=1200,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    docs = splitter.create_documents([full_text], metadatas=[{"source": source_name}])
-    for i, d in enumerate(docs):
-        d.metadata["chunk_id"] = f"{source_name}#chunk{i+1}"
+    chunks = splitter.split_text(text)
+    docs = []
+    for i, ch in enumerate(chunks):
+        if ch.strip():
+            docs.append(
+                Document(
+                    page_content=ch,
+                    metadata={"source": source_name, "chunk_id": i},
+                )
+            )
     return docs
 
-# --------------------------
-# Vector store (OpenAI embeddings)
-# --------------------------
+
 @st.cache_resource(show_spinner=False)
-def build_vs(all_chunks):
-    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    return FAISS.from_documents(all_chunks, embeddings)
+def get_embeddings():
+    return OpenAIEmbeddings(model=EMBED_MODEL)
 
-def citations_from(docs, max_refs=4):
-    seen, out = set(), []
+
+@st.cache_resource(show_spinner=False)
+def load_baseline_iso(embeddings):
+    """Load the pre-built ISO 9001 FAISS index, if it exists."""
+    if not os.path.exists(BASELINE_ISO_DIR):
+        return None
+    try:
+        db = FAISS.load_local(
+            BASELINE_ISO_DIR,
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        return db
+    except Exception as e:
+        st.warning(f"Could not load ISO baseline index: {e}")
+        return None
+
+
+def build_vs_from_docs(docs: List[Document], embeddings) -> FAISS:
+    return FAISS.from_documents(docs, embeddings)
+
+
+# --------------------------
+# Helpers: RAG answering
+# --------------------------
+
+def citations_from(docs: List[Document]) -> str:
+    """Build a simple citation string from documents' metadata."""
+    if not docs:
+        return ""
+    refs = []
     for d in docs:
-        tag = d.metadata.get("chunk_id") or d.metadata.get("source") or "doc"
-        if tag not in seen:
-            out.append(tag); seen.add(tag)
-        if len(out) >= max_refs:
-            break
-    return ", ".join(out)
+        src = d.metadata.get("source") or "ISO9001"
+        chunk_id = d.metadata.get("chunk_id")
+        label = src
+        if chunk_id is not None:
+            label = f"{src}#chunk{chunk_id}"
+        if label not in refs:
+            refs.append(label)
+    return ", ".join(refs)
 
-def answer_with_rag(vs, question):
-    retriever = vs.as_retriever(search_kwargs={"k": 4})
+
+def answer_with_rag(vector_store: FAISS, question: str) -> str:
+    """Retrieve relevant chunks and answer with LLM."""
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
     docs = retriever.get_relevant_documents(question)
 
-    context = ""
+    context_parts = []
     for d in docs:
-        tag = d.metadata.get("chunk_id") or d.metadata.get("source") or "doc"
-        context += f"[{tag}]\n{d.page_content}\n\n"
+        src = d.metadata.get("source") or "ISO9001"
+        context_parts.append(f"[{src}] {d.page_content}")
+    context = "\n\n".join(context_parts)
 
     system_prompt = (
-        "You are a Supplier Quality Auditor assistant. Use ONLY the provided context to answer. "
-        "Cite sources as (filename#chunkN). If the answer is not in the context, say you don't know."
+        "You are a supplier quality / ISO 9001 audit assistant. "
+        "Use ONLY the provided context (ISO 9001 baseline and any uploaded docs) "
+        "to answer questions. If the answer is not clearly supported, say so."
     )
-    user_prompt = f"Question: {question}\n\nContext:\n{context}\n\nAnswer:"
+
+    user_prompt = f"Question:\n{question}\n\nContext:\n{context}\n\nAnswer in a clear, concise way."
 
     llm = ChatOpenAI(model=CHAT_MODEL, temperature=0)
     resp = llm.invoke([
@@ -127,46 +168,90 @@ def answer_with_rag(vs, question):
         text += f"\n\n**Sources:** {refs}"
     return text
 
+
 # --------------------------
-# UI
+# UI / App logic
 # --------------------------
-uploaded_files = st.file_uploader(
-    "Upload one or more files", type=["pdf", "docx", "txt"], accept_multiple_files=True
-)
 
-if "vs" not in st.session_state:
-    st.session_state.vs = None
+def main():
+    st.set_page_config(page_title="Supplier Audit Assistant – Phase 3", page_icon="✅")
+    st.title("Supplier Audit Assistant – Phase 3")
+    st.markdown(
+        "Baseline: **ISO 9001** is pre-ingested (FAISS). "
+        "You can also upload supplier docs to combine with ISO."
+    )
 
-c1, c2 = st.columns([1,1])
+    embeddings = get_embeddings()
+    baseline_db = load_baseline_iso(embeddings)
 
-with c1:
-    if st.button("🔨 Build index (OpenAI)"):
-        if not uploaded_files:
-            st.warning("Please upload at least one file.")
-        else:
-            all_chunks = []
-            with st.spinner("Extracting and chunking..."):
-                for f in uploaded_files:
-                    txt = load_file(f)
-                    if txt and txt.strip():
-                        all_chunks.extend(chunk_text(txt, f.name))
-            if not all_chunks:
-                st.error("No text extracted from the files.")
+    if baseline_db is None:
+        st.warning("⚠️ ISO baseline index not found. Make sure baseline_iso9001/ exists.")
+
+    uploaded_files = st.file_uploader(
+        "Upload one or more files (optional, to add on top of ISO)",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True,
+    )
+
+    if "vs" not in st.session_state:
+        st.session_state.vs = None
+
+    c1, c2 = st.columns([1, 1])
+
+    with c1:
+        if st.button("🔨 Build / Refresh knowledge base"):
+            all_docs: List[Document] = []
+            # 1) From uploaded files
+            if uploaded_files:
+                with st.spinner("Extracting and chunking uploaded files..."):
+                    for f in uploaded_files:
+                        txt = load_file(f)
+                        if txt and txt.strip():
+                            all_docs.extend(chunk_text(txt, f.name))
+
+            user_db = None
+            if all_docs:
+                with st.spinner("Embedding uploaded documents..."):
+                    user_db = build_vs_from_docs(all_docs, embeddings)
+                    st.success(f"Uploaded docs indexed: {len(all_docs)} chunks.")
             else:
-                try:
-                    with st.spinner("Embedding & indexing with OpenAI..."):
-                        st.session_state.vs = build_vs(all_chunks)
-                    st.success(f"Index ready. {len(all_chunks)} chunks.")
-                except Exception as e:
-                    st.error(f"Embedding failed: {e}")
+                if uploaded_files:
+                    st.warning("No text extracted from uploaded files.")
 
-with c2:
-    q = st.text_input("Ask an audit question… (e.g., “What are supplier PPAP requirements?”)")
-    if q and st.session_state.vs:
-        with st.spinner("Thinking…"):
-            try:
-                st.markdown(answer_with_rag(st.session_state.vs, q))
-            except Exception as e:
-                st.error(f"LLM call failed: {e}")
-    elif q and not st.session_state.vs:
-        st.info("Build the index first, then ask a question.")
+            # 2) Combine baseline + user
+            db = None
+            if baseline_db is not None:
+                db = baseline_db
+
+            if user_db is not None:
+                if db is None:
+                    db = user_db
+                else:
+                    db.merge_from(user_db)
+
+            if db is None:
+                st.error("No knowledge base available (no ISO index and no uploaded docs).")
+            else:
+                st.session_state.vs = db
+                st.success("Knowledge base is ready (ISO baseline + optional uploads).")
+
+    with c2:
+        q = st.text_input(
+            "Ask an audit question…",
+            placeholder="e.g., What does ISO 9001 require for management review?",
+        )
+        if q:
+            if st.session_state.vs is None:
+                st.info("Click 'Build / Refresh knowledge base' first.")
+            else:
+                with st.spinner("Thinking…"):
+                    try:
+                        answer = answer_with_rag(st.session_state.vs, q)
+                        st.markdown(answer)
+                    except Exception as e:
+                        st.error(f"LLM call failed: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
